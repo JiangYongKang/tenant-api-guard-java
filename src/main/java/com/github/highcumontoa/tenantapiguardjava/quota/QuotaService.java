@@ -1,25 +1,39 @@
 package com.github.highcumontoa.tenantapiguardjava.quota;
 
+import java.util.ArrayDeque;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import com.github.highcumontoa.tenantapiguardjava.config.GuardProperties;
+import com.github.highcumontoa.tenantapiguardjava.config.GuardProperties.TenantQuotaSetting;
 import com.github.highcumontoa.tenantapiguardjava.model.QuotaDecision;
+import com.github.highcumontoa.tenantapiguardjava.model.QuotaUsage;
 import com.github.highcumontoa.tenantapiguardjava.model.RejectReason;
 
 /**
- * 按租户维度的固定时间窗口配额服务。
+ * 按租户维度的配额服务，支持两种可按租户选择的口径：
+ *
+ * <ul>
+ *   <li><b>{@link QuotaMode#FIXED}（默认，历史口径）</b>：窗口由 {@code floor(now/windowMs)}
+ *       切分，窗口交界时计数归零；</li>
+ *   <li><b>{@link QuotaMode#SLIDING}</b>：滑动日志窗口。任意长度为 {@code windowMs} 的连续
+ *       时间区间（左闭右开）内，放行总量不超过配额，消除固定窗口交界处的两段叠加放量。</li>
+ * </ul>
  *
  * <p>确定性保证：</p>
  * <ul>
- *   <li>每个租户拥有独立状态与锁，计数自增与窗口切换在锁内原子完成，
- *       并发下不会超额放行，也不会漏计/重计；</li>
- *   <li>窗口切换采用惰性重置：首个落入新窗口的请求把计数清零并从配置重新读取配额，
- *       因此配置调整在当前窗口结束、下一个窗口开始时平滑生效，不回溯当前窗口；</li>
- *   <li>租户之间状态互不影响。</li>
+ *   <li>每个租户拥有独立状态与锁，计数自增、窗口推进在锁内原子完成，无论请求如何并发交错
+ *       （包括正好压在时间交界上），同一批请求的放行总数严格确定，与调度先后无关；</li>
+ *   <li>口径/配额按租户快照隔离：不同租户各用各的口径与上限，互不相干；运行期修改某租户
+ *       口径时，该租户旧口径状态被原子封存、以新口径空状态重新计数，不影响其他租户；</li>
+ *   <li>查询（{@link #inspect} / {@link #peek}）与真实放行（{@link #tryAcquire}）走同一段
+ *       锁内判定逻辑，同一时刻对同一份状态的结论一致；查询不计数、不改结构；</li>
+ *   <li>空闲租户状态可由 {@link #evictIdle} 安全回收；回收采用 tryLock，拿不到锁（租户活跃）
+ *       立即跳过，且仅在“回收不会让后续判定变宽松”时才移除，活跃租户判定不受影响。</li>
  * </ul>
  */
 @Service
@@ -28,7 +42,7 @@ public class QuotaService {
     private static final Logger log = LoggerFactory.getLogger(QuotaService.class);
 
     private final GuardProperties properties;
-    private final ConcurrentHashMap<String, WindowState> states = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TenantState> states = new ConcurrentHashMap<>();
 
     public QuotaService(GuardProperties properties) {
         this.properties = properties;
@@ -42,79 +56,327 @@ public class QuotaService {
      */
     public QuotaDecision tryAcquire(String tenant, long nowMillis) {
         long windowMs = properties.getWindowMs();
-        long windowIndex = Math.floorDiv(nowMillis, windowMs);
-        long start = Math.multiplyExact(windowIndex, windowMs);
-        long end = start + windowMs;
-        long configuredLimit = properties.quotaOf(tenant);
-
-        if (configuredLimit <= 0) {
-            log.info("quota decision input={{}}, now={}}, window={}}, basis=tenant quota<=0, decision=REJECT reason=TENANT_NOT_CONFIGURED",
-                    tenant, nowMillis, windowIndex);
-            return QuotaDecision.reject(tenant, RejectReason.TENANT_NOT_CONFIGURED,
-                    windowIndex, start, end, 0L, 0L);
-        }
-
-        WindowState state = states.computeIfAbsent(tenant, t -> new WindowState());
-        QuotaDecision decision;
-        synchronized (state.lock) {
-            if (state.windowIndex != windowIndex) {
-                // 窗口切换：旧窗口计数封存，新窗口从 0 开始，并重新读取配置（平滑生效）
-                log.info("quota window rollover tenant={}}, oldWindow={}}, newWindow={}}, oldConsumed={}}",
-                        tenant, state.windowIndex, windowIndex, state.consumed);
-                state.windowIndex = windowIndex;
-                state.consumed = 0L;
-                state.limit = configuredLimit;
+        while (true) {
+            TenantQuotaSetting setting = properties.quotaSettingOf(tenant);
+            if (setting.limit() <= 0) {
+                long[] grid = fixedGrid(nowMillis, windowMs);
+                log.info("quota decision input={{{}}} mode={} now={} basis=tenant quota<=0 decision=REJECT reason=TENANT_NOT_CONFIGURED",
+                        tenant, setting.mode(), nowMillis);
+                return QuotaDecision.reject(tenant, setting.mode(), RejectReason.TENANT_NOT_CONFIGURED,
+                        grid[0], grid[1], grid[2], 0L, 0L);
             }
-            long limit = state.limit;
-            if (state.consumed < limit) {
-                state.consumed++;
-                decision = QuotaDecision.permit(tenant, windowIndex, start, end,
-                        state.consumed, limit);
-            } else {
-                decision = QuotaDecision.reject(tenant, RejectReason.QUOTA_EXCEEDED,
-                        windowIndex, start, end, state.consumed, limit);
+
+            TenantState state = states.computeIfAbsent(tenant,
+                    t -> createState(setting.mode(), nowMillis));
+            if (state.mode != setting.mode()) {
+                // 运行期口径变更：旧口径状态封存（丢弃），换成新口径的空状态；只影响该租户
+                TenantState fresh = createState(setting.mode(), nowMillis);
+                if (states.replace(tenant, state, fresh)) {
+                    log.info("quota mode switched tenant={} oldMode={} newMode={} basis=runtime config change, old state sealed",
+                            tenant, state.mode, setting.mode());
+                }
+                continue;
+            }
+
+            state.lock.lock();
+            try {
+                if (states.get(tenant) != state) {
+                    continue; // 持锁期间状态已被回收/替换，按新状态重判
+                }
+                Eval eval = evaluate(state, setting.limit(), nowMillis, windowMs, true);
+                state.lastAccessMs = nowMillis;
+                QuotaDecision decision = eval.allowed
+                        ? QuotaDecision.permit(tenant, state.mode, eval.windowIndex, eval.start,
+                                eval.end, eval.consumed, eval.limit)
+                        : QuotaDecision.reject(tenant, state.mode, RejectReason.QUOTA_EXCEEDED,
+                                eval.windowIndex, eval.start, eval.end, eval.consumed, eval.limit);
+                log.info("quota decision input={{{}}} mode={} now={} basis={} consumed={}/{} interval=[{},{}) decision={}",
+                        tenant, state.mode, nowMillis, state.mode,
+                        eval.consumed, eval.limit, eval.start, eval.end,
+                        eval.allowed ? "PASS" : "REJECT/QUOTA_EXCEEDED");
+                return decision;
+            } finally {
+                state.lock.unlock();
             }
         }
-        log.info("quota decision input={{}}, now={}}, window={}}, basis=consumed {}/{}} in [{},{})",
-                tenant, nowMillis, windowIndex, decision.consumed(), decision.limit(), start, end);
-        return decision;
     }
 
     /**
-     * 仅供测试/运维：查看某租户当前窗口的已用计数与是否还可放行，不产生计数，不触发窗口重置。
+     * 只读查看某租户当前配额用量：已用、剩余、所算区间及“此刻再来一个是否放行”的判定依据。
+     *
+     * <p>不占用配额、不改变任何运行时结构（滑动口径连过期时间戳都不在本调用中摘除）；
+     * 结论与同一时刻 {@link #tryAcquire} 的放行/拒绝一致。</p>
      */
-    public QuotaDecision peek(String tenant, long nowMillis) {
+    public QuotaUsage inspect(String tenant, long nowMillis) {
         long windowMs = properties.getWindowMs();
-        long windowIndex = Math.floorDiv(nowMillis, windowMs);
-        long start = Math.multiplyExact(windowIndex, windowMs);
-        long end = start + windowMs;
-        long configuredLimit = properties.quotaOf(tenant);
-        if (configuredLimit <= 0) {
-            return QuotaDecision.reject(tenant, RejectReason.TENANT_NOT_CONFIGURED,
-                    windowIndex, start, end, 0L, 0L);
+        TenantQuotaSetting setting = properties.quotaSettingOf(tenant);
+        if (setting.limit() <= 0) {
+            long[] grid = fixedGrid(nowMillis, windowMs);
+            QuotaUsage u = QuotaUsage.of(tenant, setting.mode(), false,
+                    RejectReason.TENANT_NOT_CONFIGURED, 0L, 0L, 0L,
+                    grid[0], grid[1], grid[2], nowMillis);
+            log.info("quota inspect input={{{}}} mode={} now={} basis=tenant quota<=0 allowed=false reason=TENANT_NOT_CONFIGURED",
+                    tenant, setting.mode(), nowMillis);
+            return u;
         }
-        WindowState state = states.get(tenant);
-        long consumed = 0L;
-        long limit = configuredLimit;
-        if (state != null) {
-            synchronized (state.lock) {
-                if (state.windowIndex == windowIndex) {
-                    consumed = state.consumed;
-                    limit = state.limit;
+
+        while (true) {
+            TenantState state = states.get(tenant);
+            if (state == null) {
+                QuotaUsage u = freshUsage(tenant, setting, nowMillis, windowMs);
+                log.info("quota inspect input={{{}}} mode={} now={} basis=no runtime state yet consumed=0/{}} allowed=true",
+                        tenant, setting.mode(), nowMillis, setting.limit());
+                return u;
+            }
+            if (state.mode != setting.mode()) {
+                // 口径已改但首个新口径请求尚未到达：真实请求会以新口径空状态重计，查询保持同一结论
+                QuotaUsage u = freshUsage(tenant, setting, nowMillis, windowMs);
+                log.info("quota inspect input={{{}}} mode={} now={} basis=mode switch pending, new state empty consumed=0/{} allowed=true",
+                        tenant, setting.mode(), nowMillis, setting.limit());
+                return u;
+            }
+            state.lock.lock();
+            try {
+                if (states.get(tenant) != state) {
+                    continue;
                 }
+                Eval eval = evaluate(state, setting.limit(), nowMillis, windowMs, false);
+                long remaining = Math.max(0L, eval.limit - eval.consumed);
+                QuotaUsage u = QuotaUsage.of(tenant, state.mode, eval.allowed,
+                        eval.allowed ? null : RejectReason.QUOTA_EXCEEDED,
+                        eval.consumed, remaining, eval.limit,
+                        eval.windowIndex, eval.start, eval.end, nowMillis);
+                log.info("quota inspect input={{{}}} mode={} now={} basis={} consumed={}/{} remaining={} interval=[{},{}) allowed={}",
+                        tenant, state.mode, nowMillis, state.mode,
+                        eval.consumed, eval.limit, remaining, eval.start, eval.end, eval.allowed);
+                return u;
+            } finally {
+                state.lock.unlock();
             }
         }
-        return consumed < limit
-                ? QuotaDecision.permit(tenant, windowIndex, start, end, consumed, limit)
-                : QuotaDecision.reject(tenant, RejectReason.QUOTA_EXCEEDED,
-                        windowIndex, start, end, consumed, limit);
     }
 
-    /** 单个租户的窗口计数状态。 */
-    private static final class WindowState {
-        private final Object lock = new Object();
+    /**
+     * 只读：查看某租户当前时刻能否再放行，不产生计数、不改变状态。
+     */
+    public QuotaDecision peek(String tenant, long nowMillis) {
+        QuotaUsage u = inspect(tenant, nowMillis);
+        return u.allowed()
+                ? QuotaDecision.permit(tenant, u.mode(), u.windowIndex(), u.windowStartMs(),
+                        u.windowEndMs(), u.consumed(), u.limit())
+                : QuotaDecision.reject(tenant, u.mode(), u.reason(), u.windowIndex(),
+                        u.windowStartMs(), u.windowEndMs(), u.consumed(), u.limit());
+    }
+
+    /**
+     * 回收长时间无请求的租户状态。
+     *
+     * @param nowMillis 当前时间
+     * @param idleMs    空闲阈值（最近一次 tryAcquire 距 now 超过该值才考虑回收）
+     * @return 实际回收的租户数
+     */
+    public int evictIdle(long nowMillis, long idleMs) {
+        if (idleMs <= 0) {
+            return 0;
+        }
+        long windowMs = properties.getWindowMs();
+        int removed = 0;
+        for (var entry : states.entrySet()) {
+            TenantState state = entry.getValue();
+            // 活跃租户（恰好有请求在判定）直接跳过，绝不阻塞或干扰在线请求
+            if (!state.lock.tryLock()) {
+                continue;
+            }
+            try {
+                if (states.get(entry.getKey()) != state) {
+                    continue;
+                }
+                if (nowMillis - state.lastAccessMs < idleMs) {
+                    continue;
+                }
+                if (!safeToEvict(state, nowMillis, windowMs)) {
+                    continue;
+                }
+                if (states.remove(entry.getKey(), state)) {
+                    removed++;
+                    log.info("quota state evicted tenant={} mode={} basis=idle>{}ms and no live count, lastAccess={} now={}",
+                            entry.getKey(), state.mode, idleMs, state.lastAccessMs, nowMillis);
+                }
+            } finally {
+                state.lock.unlock();
+            }
+        }
+        if (removed > 0) {
+            log.info("quota idle eviction sweep now={} idleMs={} removed={} remaining={}",
+                    nowMillis, idleMs, removed, states.size());
+        }
+        return removed;
+    }
+
+    // ------------------------------------------------------------------
+    // 内部：状态与判定
+    // ------------------------------------------------------------------
+
+    private TenantState createState(QuotaMode mode, long nowMillis) {
+        return mode == QuotaMode.SLIDING
+                ? new SlidingState(nowMillis)
+                : new FixedState(nowMillis);
+    }
+
+    /**
+     * 锁内执行唯一一段配额判定。{@code acquire=true} 时为真实占用（允许变更计数），
+     * {@code false} 时为只读观测（不做任何结构变更）。查询与放行共用此方法，
+     * 保证同一时刻同一状态结论一致。
+     */
+    private Eval evaluate(TenantState state, long configuredLimit, long now, long windowMs,
+                          boolean acquire) {
+        if (state.mode == QuotaMode.SLIDING) {
+            return evaluateSliding((SlidingState) state, configuredLimit, now, windowMs, acquire);
+        }
+        return evaluateFixed((FixedState) state, configuredLimit, now, windowMs, acquire);
+    }
+
+    private Eval evaluateFixed(FixedState fx, long configuredLimit, long now, long windowMs,
+                               boolean acquire) {
+        long windowIndex = Math.floorDiv(now, windowMs);
+        long start = Math.multiplyExact(windowIndex, windowMs);
+        long end = start + windowMs;
+        long consumed;
+        long limit;
+        if (fx.windowIndex != windowIndex) {
+            // 落入新窗口：新窗口从 0 起算，并从配置重读配额（平滑生效，不回溯旧窗口）
+            if (acquire) {
+                log.info("quota window rollover basis=fixed oldWindow={} newWindow={} oldConsumed={}",
+                        fx.windowIndex, windowIndex, fx.consumed);
+                fx.windowIndex = windowIndex;
+                fx.consumed = 0L;
+                fx.limit = configuredLimit;
+            }
+            consumed = 0L;
+            limit = configuredLimit;
+        } else {
+            consumed = fx.consumed;
+            limit = fx.limit;
+        }
+        // 放行判定基于递增前的计数；consumed 字段记录的是递增后的已用量
+        boolean allowed = consumed < limit;
+        if (acquire && allowed) {
+            fx.consumed++;
+            consumed = fx.consumed;
+        }
+        return new Eval(windowIndex, start, end, consumed, limit, allowed);
+    }
+
+    private Eval evaluateSliding(SlidingState sl, long configuredLimit, long now, long windowMs,
+                                 boolean acquire) {
+        sl.limit = configuredLimit; // 滑动口径无窗口交界，配额调整即时生效
+        long cutoff = now - windowMs;
+        long windowIndex = Math.floorDiv(now, windowMs);
+        long start = now - windowMs;
+        long end = now;
+        if (acquire) {
+            // 严格滑出左边界（ts <= cutoff）的记录失效；存活区间 (cutoff, now] 即 (now-windowMs, now]
+            sl.stamps.removeIf(ts -> ts <= cutoff);
+            long live = sl.stamps.size();
+            boolean allowed = live < configuredLimit;
+            if (allowed) {
+                sl.stamps.addLast(now);
+                live++;
+            }
+            return new Eval(windowIndex, start, end, live, configuredLimit, allowed);
+        }
+        // 只读：不摘除任何元素（队列长度由占用路径的清理上界为 max(limit)），纯计数
+        long live = 0L;
+        for (long ts : sl.stamps) {
+            if (ts > cutoff) {
+                live++;
+            }
+        }
+        return new Eval(windowIndex, start, end, live, configuredLimit, live < configuredLimit);
+    }
+
+    /** 回收后不会让新请求的判定变宽松，才允许回收（调用方持锁）。 */
+    private boolean safeToEvict(TenantState state, long now, long windowMs) {
+        if (state instanceof FixedState fx) {
+            long windowIndex = Math.floorDiv(now, windowMs);
+            if (fx.windowIndex != windowIndex) {
+                return true; // 计数所属窗口已整体过去，早已失效
+            }
+            return fx.consumed == 0L; // 当前窗口没有任何放行，回收与否结论相同
+        }
+        SlidingState sl = (SlidingState) state;
+        long cutoff = now - windowMs;
+        for (long ts : sl.stamps) {
+            if (ts > cutoff) {
+                return false; // 还有存活计数，回收会让后续判定变宽松，本轮跳过
+            }
+        }
+        return true;
+    }
+
+    private QuotaUsage freshUsage(String tenant, TenantQuotaSetting setting, long now,
+                                  long windowMs) {
+        long consumed = 0L;
+        long windowIndex;
+        long start;
+        long end;
+        if (setting.mode() == QuotaMode.SLIDING) {
+            windowIndex = Math.floorDiv(now, windowMs);
+            start = now - windowMs;
+            end = now;
+        } else {
+            long[] grid = fixedGrid(now, windowMs);
+            windowIndex = grid[0];
+            start = grid[1];
+            end = grid[2];
+        }
+        return QuotaUsage.of(tenant, setting.mode(), true, null,
+                consumed, setting.limit(), setting.limit(),
+                windowIndex, start, end, now);
+    }
+
+    /** @return [windowIndex, start, end] */
+    private static long[] fixedGrid(long now, long windowMs) {
+        long windowIndex = Math.floorDiv(now, windowMs);
+        long start = Math.multiplyExact(windowIndex, windowMs);
+        return new long[]{windowIndex, start, start + windowMs};
+    }
+
+    /** 锁内判定结果。 */
+    private record Eval(long windowIndex, long start, long end, long consumed, long limit,
+                        boolean allowed) {
+    }
+
+    /** 单租户配额状态基类；{@code lock} 保护该租户全部计数。 */
+    private abstract static class TenantState {
+        private final ReentrantLock lock = new ReentrantLock();
+        private final QuotaMode mode;
+        private volatile long lastAccessMs;
+
+        TenantState(QuotaMode mode, long nowMillis) {
+            this.mode = mode;
+            this.lastAccessMs = nowMillis;
+        }
+    }
+
+    /** 固定窗口状态。 */
+    private static final class FixedState extends TenantState {
         private long windowIndex = Long.MIN_VALUE;
         private long consumed;
         private long limit;
+
+        FixedState(long nowMillis) {
+            super(QuotaMode.FIXED, nowMillis);
+        }
+    }
+
+    /** 滑动窗口状态：{@code stamps} 为历次放行时刻（升序），存活数即当前区间已用量。 */
+    private static final class SlidingState extends TenantState {
+        private final ArrayDeque<Long> stamps = new ArrayDeque<>();
+        private long limit;
+
+        SlidingState(long nowMillis) {
+            super(QuotaMode.SLIDING, nowMillis);
+        }
     }
 }

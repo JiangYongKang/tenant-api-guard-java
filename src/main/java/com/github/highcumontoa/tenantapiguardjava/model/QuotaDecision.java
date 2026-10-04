@@ -1,9 +1,12 @@
 package com.github.highcumontoa.tenantapiguardjava.model;
 
+import com.github.highcumontoa.tenantapiguardjava.quota.QuotaMode;
+
 /**
  * 配额判定结论（不可变）。
  *
  * @param tenant          租户标识
+ * @param mode            判定所使用的配额口径（FIXED / SLIDING）
  * @param allowed         是否放行
  * @param reason          被拒绝时的稳定原因；放行时为 {@code null}
  * @param windowIndex     命中的时间窗口序号（从 epoch 起算），用于解释窗口切换
@@ -14,6 +17,7 @@ package com.github.highcumontoa.tenantapiguardjava.model;
  */
 public record QuotaDecision(
         String tenant,
+        QuotaMode mode,
         boolean allowed,
         RejectReason reason,
         long windowIndex,
@@ -22,13 +26,14 @@ public record QuotaDecision(
         long consumed,
         long limit) {
 
-    public static QuotaDecision permit(String tenant, long windowIndex, long start, long end,
-                                       long consumed, long limit) {
-        return new QuotaDecision(tenant, true, null, windowIndex, start, end, consumed, limit);
+    public static QuotaDecision permit(String tenant, QuotaMode mode, long windowIndex, long start,
+                                       long end, long consumed, long limit) {
+        return new QuotaDecision(tenant, mode, true, null, windowIndex, start, end, consumed, limit);
     }
 
-    public static QuotaDecision reject(String tenant, RejectReason reason, long windowIndex,
-                                       long start, long end, long consumed, long limit) {
-        return new QuotaDecision(tenant, false, reason, windowIndex, start, end, consumed, limit);
+    public static QuotaDecision reject(String tenant, QuotaMode mode, RejectReason reason,
+                                       long windowIndex, long start, long end,
+                                       long consumed, long limit) {
+        return new QuotaDecision(tenant, mode, false, reason, windowIndex, start, end, consumed, limit);
     }
 }

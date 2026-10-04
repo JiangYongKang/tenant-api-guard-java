@@ -65,6 +65,7 @@ public class GuardInterceptor implements HandlerInterceptor {
         if (!quota.allowed()) {
             Map<String, Object> detail = new LinkedHashMap<>();
             detail.put("tenant", tenant);
+            detail.put("mode", quota.mode().name());
             detail.put("windowIndex", quota.windowIndex());
             detail.put("windowStartMs", quota.windowStartMs());
             detail.put("windowEndMs", quota.windowEndMs());
