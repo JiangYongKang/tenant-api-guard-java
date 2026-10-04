@@ -5,6 +5,8 @@ import java.util.Map;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import com.github.highcumontoa.tenantapiguardjava.model.WindowMode;
+
 /**
  * 本地可配置项（application.properties / YAML），支持按租户调整。
  *
@@ -31,6 +33,16 @@ public class GuardProperties {
 
     /** 首次请求处于执行中时，重复请求的等待/执行超时（毫秒）。 */
     private long inProgressTimeoutMs = 10_000L;
+
+    /**
+     * 配额运行时状态的不活跃回收阈值（毫秒）。租户超过该时长没有任何请求后，
+     * 其配额状态可被回收。实际生效阈值为 max(stateIdleMs, windowMs)，
+     * 保证回收永远发生在状态语义过期之后，不影响活跃租户的判定。
+     */
+    private long stateIdleMs = 600_000L;
+
+    /** 不活跃状态定时回收的执行间隔（毫秒）。 */
+    private long sweepIntervalMs = 60_000L;
 
     /** 按租户配置：key 为租户标识。 */
     private Map<String, TenantConfig> tenants = new LinkedHashMap<>();
@@ -83,6 +95,22 @@ public class GuardProperties {
         this.inProgressTimeoutMs = inProgressTimeoutMs;
     }
 
+    public long getStateIdleMs() {
+        return stateIdleMs;
+    }
+
+    public void setStateIdleMs(long stateIdleMs) {
+        this.stateIdleMs = stateIdleMs;
+    }
+
+    public long getSweepIntervalMs() {
+        return sweepIntervalMs;
+    }
+
+    public void setSweepIntervalMs(long sweepIntervalMs) {
+        this.sweepIntervalMs = sweepIntervalMs;
+    }
+
     public Map<String, TenantConfig> getTenants() {
         return tenants;
     }
@@ -114,6 +142,17 @@ public class GuardProperties {
     }
 
     /**
+     * 读取租户的配额口径；未配置时回落到 {@link WindowMode#FIXED}（保持既有行为）。
+     */
+    public synchronized WindowMode windowModeOf(String tenant) {
+        TenantConfig cfg = tenants.get(tenant);
+        if (cfg != null && cfg.getWindowMode() != null) {
+            return cfg.getWindowMode();
+        }
+        return WindowMode.FIXED;
+    }
+
+    /**
      * 单个租户的本地配置。
      */
     public static class TenantConfig {
@@ -121,6 +160,8 @@ public class GuardProperties {
         private Long quota;
         /** 并发槽上限；为 null 时回落默认值。 */
         private Integer maxConcurrent;
+        /** 配额口径（FIXED/SLIDING）；为 null 时回落 FIXED。 */
+        private WindowMode windowMode;
 
         public Long getQuota() {
             return quota;
@@ -136,6 +177,14 @@ public class GuardProperties {
 
         public void setMaxConcurrent(Integer maxConcurrent) {
             this.maxConcurrent = maxConcurrent;
+        }
+
+        public WindowMode getWindowMode() {
+            return windowMode;
+        }
+
+        public void setWindowMode(WindowMode windowMode) {
+            this.windowMode = windowMode;
         }
     }
 }
