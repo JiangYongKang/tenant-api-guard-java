@@ -10,8 +10,8 @@ import com.github.highcumontoa.tenantapiguardjava.quota.QuotaMode;
 /**
  * 本地可配置项（application.properties / YAML），支持按租户调整。
  *
- * <p>前缀 {@code tenant.guard}。配置变更后，配额在下一个时间窗口边界平滑生效，
- * 不会回溯改写当前窗口的计数。</p>
+ * <p>前缀 {@code tenant.guard}。配额判定每次都读取最新配置：配置变更后下一笔判定即按
+ * 新上限执行（不回溯已放行记录，但不存在旧上限缓存导致的多放/少放）。</p>
  */
 @ConfigurationProperties(prefix = "tenant.guard")
 public class GuardProperties {

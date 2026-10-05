@@ -1,6 +1,7 @@
 package com.github.highcumontoa.tenantapiguardjava.quota;
 
 import java.util.ArrayDeque;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -19,17 +20,21 @@ import com.github.highcumontoa.tenantapiguardjava.model.RejectReason;
  *
  * <ul>
  *   <li><b>{@link QuotaMode#FIXED}（默认，历史口径）</b>：窗口由 {@code floor(now/windowMs)}
- *       切分，窗口交界时计数归零；</li>
+ *       切分，每个网格窗口拥有独立计数槽；新窗口的请求只为自己的窗口开账，从不清零其它
+ *       窗口的计数。交界两侧的请求无论怎么交错，每段放行数都不超过该租户配额，整批总数
+ *       严格确定（只保留相邻两个窗口的槽位，更早窗口的迟到请求保守拒绝）；</li>
  *   <li><b>{@link QuotaMode#SLIDING}</b>：滑动日志窗口。任意长度为 {@code windowMs} 的连续
  *       时间区间（左闭右开）内，放行总量不超过配额，消除固定窗口交界处的两段叠加放量。</li>
  * </ul>
  *
  * <p>确定性保证：</p>
  * <ul>
- *   <li>每个租户拥有独立状态与锁，计数自增、窗口推进在锁内原子完成，无论请求如何并发交错
- *       （包括正好压在时间交界上），同一批请求的放行总数严格确定，与调度先后无关；</li>
- *   <li>口径/配额按租户快照隔离：不同租户各用各的口径与上限，互不相干；运行期修改某租户
- *       口径时，该租户旧口径状态被原子封存、以新口径空状态重新计数，不影响其他租户；</li>
+ *   <li>每个租户拥有独立状态与锁，计数自增、新窗口开账在锁内原子完成，无论请求如何并发交错
+ *       （包括正好压在时间交界上、时间戳乱序到达），同一批请求的放行总数严格确定，与调度
+ *       先后无关；</li>
+ *   <li>口径/配额按租户快照隔离：不同租户各用各的口径与上限，互不相干；判定每次都重读该
+ *       租户最新配额，运行期调配额后后续判定立即与新配置一致；运行期修改某租户口径时，
+ *       该租户旧口径状态被原子封存、以新口径空状态重新计数，不影响其他租户；</li>
  *   <li>查询（{@link #inspect} / {@link #peek}）与真实放行（{@link #tryAcquire}）走同一段
  *       锁内判定逻辑，同一时刻对同一份状态的结论一致；查询不计数、不改结构；</li>
  *   <li>空闲租户状态可由 {@link #evictIdle} 安全回收；回收采用 tryLock，拿不到锁（租户活跃）
@@ -241,30 +246,46 @@ public class QuotaService {
         long windowIndex = Math.floorDiv(now, windowMs);
         long start = Math.multiplyExact(windowIndex, windowMs);
         long end = start + windowMs;
-        long consumed;
-        long limit;
-        if (fx.windowIndex != windowIndex) {
-            // 落入新窗口：新窗口从 0 起算，并从配置重读配额（平滑生效，不回溯旧窗口）
+
+        // 比“已观察到的最新窗口”还早整整一个窗口以上的迟到请求：其窗口计数早已不在保留的
+        // 相邻两窗范围内。固定窗口语义下该窗口本就不应再被本次批次放行，保守判定为拒绝，
+        // 结论同样与调度顺序无关（不会重建计数把旧窗口重新放开）。
+        if (fx.latestWindowIndex != null && windowIndex < fx.latestWindowIndex - 1L) {
             if (acquire) {
-                log.info("quota window rollover basis=fixed oldWindow={} newWindow={} oldConsumed={}",
-                        fx.windowIndex, windowIndex, fx.consumed);
-                fx.windowIndex = windowIndex;
-                fx.consumed = 0L;
-                fx.limit = configuredLimit;
+                log.info("quota fixed stale-window reject basis=window {} older than retained latest {}",
+                        windowIndex, fx.latestWindowIndex);
             }
-            consumed = 0L;
-            limit = configuredLimit;
-        } else {
-            consumed = fx.consumed;
-            limit = fx.limit;
+            return new Eval(windowIndex, start, end, configuredLimit, configuredLimit, false);
         }
-        // 放行判定基于递增前的计数；consumed 字段记录的是递增后的已用量
-        boolean allowed = consumed < limit;
+
+        long[] slot = fx.counts.get(windowIndex);
+        long consumed = slot == null ? 0L : slot[0];
+        boolean newSlot = slot == null && acquire;
+        if (newSlot) {
+            // 该窗口第一次被真实请求命中：为这个窗口开一个从 0 起算的独立计数；
+            // 不清零、不覆盖任何其它窗口已有计数。只读查询不落任何槽位
+            slot = new long[1];
+            fx.counts.put(windowIndex, slot);
+        }
+        // 放行判定基于递增前的计数；判定始终采用此刻读到的最新配置上限，
+        // 运行期改配额后同一窗口的后续判定立即与新配置一致，无旧 limit 残留。
+        boolean allowed = consumed < configuredLimit;
         if (acquire && allowed) {
-            fx.consumed++;
-            consumed = fx.consumed;
+            slot[0]++;
+            consumed = slot[0];
         }
-        return new Eval(windowIndex, start, end, consumed, limit, allowed);
+        if (acquire && (fx.latestWindowIndex == null || windowIndex > fx.latestWindowIndex)) {
+            fx.latestWindowIndex = windowIndex;
+            // 只留最新两个窗口的槽位，内存占用为常量；更早窗口的判定已在上文覆盖
+            while (fx.counts.size() > FixedState.RETAINED_WINDOWS) {
+                fx.counts.pollFirstEntry();
+            }
+        }
+        if (newSlot) {
+            log.info("quota window rollover basis=fixed newWindow={} otherWindowSlotsKept={}",
+                    windowIndex, fx.counts.size() - 1);
+        }
+        return new Eval(windowIndex, start, end, consumed, configuredLimit, allowed);
     }
 
     private Eval evaluateSliding(SlidingState sl, long configuredLimit, long now, long windowMs,
@@ -299,10 +320,11 @@ public class QuotaService {
     private boolean safeToEvict(TenantState state, long now, long windowMs) {
         if (state instanceof FixedState fx) {
             long windowIndex = Math.floorDiv(now, windowMs);
-            if (fx.windowIndex != windowIndex) {
-                return true; // 计数所属窗口已整体过去，早已失效
-            }
-            return fx.consumed == 0L; // 当前窗口没有任何放行，回收与否结论相同
+            long[] current = fx.counts.get(windowIndex);
+            // 墙钟当前窗口有非零计数时回收会让判定变宽松，必须保留。上一窗口的槽位只服务于
+            // 交界批次里持着上一窗口时间戳的在途请求；能走到回收说明该租户已空闲超过回收
+            // 阈值（默认数十分钟），这种在途请求不可能还存在，旧窗口槽位不再构成放宽风险。
+            return current == null || current[0] == 0L;
         }
         SlidingState sl = (SlidingState) state;
         long cutoff = now - windowMs;
@@ -359,11 +381,22 @@ public class QuotaService {
         }
     }
 
-    /** 固定窗口状态。 */
+    /**
+     * 固定窗口状态：每个网格窗口拥有自己独立的计数槽位。
+     *
+     * <p>关键点：窗口计数<b>绝不因为另一个窗口的请求到来而被清零</b>。交界两侧的请求无论以
+     * 什么顺序交错判定，都各记各窗口的账，因此“每段不超配额”和放行总数与调度先后无关。
+     * {@code counts} 的 key 为窗口序号，value 为该窗口已放行数；为把内存上界钉死为常量，
+     * 只保留最新观察到的两个窗口（当前窗口与前一窗口，正好覆盖交界并发），更早的窗口计数
+     * 不再可能影响判定。所有访问均在该租户自己的锁内进行。</p>
+     */
     private static final class FixedState extends TenantState {
-        private long windowIndex = Long.MIN_VALUE;
-        private long consumed;
-        private long limit;
+        /** 保留的窗口槽位数：当前窗口 + 相邻的前一窗口。 */
+        private static final int RETAINED_WINDOWS = 2;
+
+        private final TreeMap<Long, long[]> counts = new TreeMap<>();
+        /** 已观察到的最大窗口序号；{@code null} 表示一笔请求都还没有。 */
+        private Long latestWindowIndex;
 
         FixedState(long nowMillis) {
             super(QuotaMode.FIXED, nowMillis);
