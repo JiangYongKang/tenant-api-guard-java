@@ -1,6 +1,7 @@
 package com.github.highcumontoa.tenantapiguardjava.quota;
 
 import java.util.ArrayDeque;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -26,10 +27,15 @@ import com.github.highcumontoa.tenantapiguardjava.model.RejectReason;
  *
  * <p>确定性保证：</p>
  * <ul>
- *   <li>每个租户拥有独立状态与锁，计数自增、窗口推进在锁内原子完成，无论请求如何并发交错
- *       （包括正好压在时间交界上），同一批请求的放行总数严格确定，与调度先后无关；</li>
+ *   <li>每个租户拥有独立状态与锁，计数自增、窗口推进在锁内原子完成。固定口径按
+ *       “时间段序号 → 该段独立计数槽”分别记账，请求属于哪一段就在哪一段判定与自增，
+ *       不会因相邻两段的请求在锁内来回交错而把另一段清零；因此一批并发请求即使一半压在
+ *       交界前一刻、一半压在后一刻，放行总数也恒为
+ *       {@code min(前段请求数,配额) + min(后段请求数,配额)}，每段绝不超过该租户自己的配额，
+ *       与线程调度先后无关；</li>
  *   <li>口径/配额按租户快照隔离：不同租户各用各的口径与上限，互不相干；运行期修改某租户
- *       口径时，该租户旧口径状态被原子封存、以新口径空状态重新计数，不影响其他租户；</li>
+ *       口径时，该租户旧口径状态被原子封存、以新口径空状态重新计数，不影响其他租户；
+ *       固定口径下配额调整对新时间段平滑生效、不回溯旧时间段，滑动口径即时生效；</li>
  *   <li>查询（{@link #inspect} / {@link #peek}）与真实放行（{@link #tryAcquire}）走同一段
  *       锁内判定逻辑，同一时刻对同一份状态的结论一致；查询不计数、不改结构；</li>
  *   <li>空闲租户状态可由 {@link #evictIdle} 安全回收；回收采用 tryLock，拿不到锁（租户活跃）
@@ -236,35 +242,51 @@ public class QuotaService {
         return evaluateFixed((FixedState) state, configuredLimit, now, windowMs, acquire);
     }
 
+    /**
+     * 固定时间段口径判定（调用方持有该租户锁）。
+     *
+     * <p>每个时间段（固定格）维护<b>各自独立</b>的计数槽 {@link WindowCount}：
+     * 请求归属哪个时间段，就只在那个时间段的槽上判定与自增，绝不因为“上一笔请求属于
+     * 另一个时间段”而把本时间段的计数清零。因此即使交界两侧的请求在锁内来回交错，
+     * 每段放行数也都是 {@code min(到达该段的请求数, 该段配额)}，两段合计严格确定，
+     * 与到达/判定的先后顺序无关。</p>
+     */
     private Eval evaluateFixed(FixedState fx, long configuredLimit, long now, long windowMs,
                                boolean acquire) {
         long windowIndex = Math.floorDiv(now, windowMs);
         long start = Math.multiplyExact(windowIndex, windowMs);
         long end = start + windowMs;
-        long consumed;
-        long limit;
-        if (fx.windowIndex != windowIndex) {
-            // 落入新窗口：新窗口从 0 起算，并从配置重读配额（平滑生效，不回溯旧窗口）
+
+        WindowCount slot = fx.windows.get(windowIndex);
+        if (slot == null) {
+            // 首次出现的时间段：从 0 起算，该段配额在此时从配置快照固化
+            // （配额调整对新时间段平滑生效，不回溯任何旧时间段）
+            slot = new WindowCount(configuredLimit);
             if (acquire) {
-                log.info("quota window rollover basis=fixed oldWindow={} newWindow={} oldConsumed={}",
-                        fx.windowIndex, windowIndex, fx.consumed);
-                fx.windowIndex = windowIndex;
-                fx.consumed = 0L;
-                fx.limit = configuredLimit;
+                fx.windows.put(windowIndex, slot);
+                log.info("quota window rollover basis=fixed newWindow={} limit={} priorWindows={}",
+                        windowIndex, configuredLimit, fx.windows.size() - 1);
+                pruneFixedWindows(fx, windowIndex);
             }
-            consumed = 0L;
-            limit = configuredLimit;
-        } else {
-            consumed = fx.consumed;
-            limit = fx.limit;
         }
-        // 放行判定基于递增前的计数；consumed 字段记录的是递增后的已用量
+
+        long consumed = slot.consumed;
+        long limit = slot.limit;
         boolean allowed = consumed < limit;
         if (acquire && allowed) {
-            fx.consumed++;
-            consumed = fx.consumed;
+            slot.consumed++;
+            consumed = slot.consumed;
         }
         return new Eval(windowIndex, start, end, consumed, limit, allowed);
+    }
+
+    /**
+     * 仅保留当前时间段与紧邻的上一个时间段（调用方持锁）。
+     * 交界并发时两侧请求会交错到达，上一段的槽必须保留到这批请求判定完毕；
+     * 更早的时间段不可能再有请求落入，移除安全且把每租户槽数上界压到 2。
+     */
+    private void pruneFixedWindows(FixedState fx, long currentWindowIndex) {
+        fx.windows.headMap(currentWindowIndex - 1L, false).clear();
     }
 
     private Eval evaluateSliding(SlidingState sl, long configuredLimit, long now, long windowMs,
@@ -299,10 +321,10 @@ public class QuotaService {
     private boolean safeToEvict(TenantState state, long now, long windowMs) {
         if (state instanceof FixedState fx) {
             long windowIndex = Math.floorDiv(now, windowMs);
-            if (fx.windowIndex != windowIndex) {
-                return true; // 计数所属窗口已整体过去，早已失效
-            }
-            return fx.consumed == 0L; // 当前窗口没有任何放行，回收与否结论相同
+            WindowCount current = fx.windows.get(windowIndex);
+            // 仅当“当前时间段”没有任何放行计数时回收才不会放宽判定；更早时间段的计数本就失效。
+            // 交界两侧交错在途的请求不依赖回收路径——它们的计数槽由占用路径按时间段保留。
+            return current == null || current.consumed == 0L;
         }
         SlidingState sl = (SlidingState) state;
         long cutoff = now - windowMs;
@@ -359,14 +381,27 @@ public class QuotaService {
         }
     }
 
-    /** 固定窗口状态。 */
+    /**
+     * 固定窗口状态：按时间段序号保存各自独立的计数槽。
+     *
+     * <p>这是交界并发确定性的关键——不能只记“最近一次见到的时间段”，否则交界两侧的请求
+     * 交错时会反复把对方时间段的计数清零；每个时间段各存一份，锁内判定互不干扰。</p>
+     */
     private static final class FixedState extends TenantState {
-        private long windowIndex = Long.MIN_VALUE;
-        private long consumed;
-        private long limit;
+        private final TreeMap<Long, WindowCount> windows = new TreeMap<>();
 
         FixedState(long nowMillis) {
             super(QuotaMode.FIXED, nowMillis);
+        }
+    }
+
+    /** 单个固定时间段内的计数与该时间段生效时固化的配额上限。 */
+    private static final class WindowCount {
+        private long consumed;
+        private final long limit;
+
+        WindowCount(long limit) {
+            this.limit = limit;
         }
     }
 
